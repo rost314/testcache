@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import hashlib
 import os
 import re
+import os.path
+
 from errno import EPERM
 from logging import error, getLogger
 from optparse import OptionParser
@@ -25,11 +28,26 @@ from ptrace.syscall import (FILENAME_ARGUMENTS, SOCKET_SYSCALL_NAMES,
 
 class Inputs:
     """Holds a collection of all inputs which should lead to the same output"""
-    filenames = list()
-    # file hashes etc
+    files_to_hash = dict()  # path -> hash
+    files_to_stat = dict()  # path -> stat
 
     def cache_additional_file(self, filename: str) -> None:
-        self.filenames.append(filename)
+        self.files_to_hash[filename] = Utils.get_digest(filename)
+
+    def cache_stat(self, filename: str) -> None:
+        try:
+            stat_result: os.stat_result = os.stat(filename)
+        except FileNotFoundError:
+            stat_result = None
+
+        self.files_to_stat[filename] = stat_result
+
+    def print(self) -> None:
+        for file, digest in self.files_to_hash.items():
+            print(f"hash: {file} = {digest}")
+
+        for file, stat_result in self.files_to_stat.items():
+            print(f"stat: {file} = {stat_result}")
 
 
 class Utils:
@@ -47,6 +65,23 @@ class Utils:
         filename: str = os.fsdecode(cstring)
         return filename
 
+    def get_digest(file_path: str) -> str:
+        # Reuse stat call? Usually there was a stat call before this.
+        if not os.path.exists(file_path):
+            return None
+
+        h = hashlib.sha256()
+
+        with open(file_path, 'rb') as file:
+            while True:
+                # Reading is buffered, so we can read smaller chunks.
+                chunk = file.read(h.block_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+
+        return h.hexdigest()
+
 
 class SyscallListener:
     # In theory this class could be made ptrace independent.
@@ -54,6 +89,11 @@ class SyscallListener:
     # And what's even the point? This handles Linux specific syscalls anyway.
 
     inputs: Inputs
+
+    # stdout, stderr... but mixed... puh...
+    output: int
+
+    filedescriptor_to_path = dict()
 
     def __init__(self):
         self.inputs = Inputs()
@@ -123,6 +163,10 @@ class SyscallListener:
                 else:
                     print(f"> Abort: Not readonly access to {filename}")
 
+                fd: int = syscall.result
+                self.filedescriptor_to_path[fd] = filename
+                print(f"> Tracking fd: {fd} = {filename}")
+
             if syscall.name == "access":
                 filename = Utils.readFilenameFromSyscallParameter(
                     syscall, 'filename')
@@ -133,12 +177,25 @@ class SyscallListener:
             if syscall.name == "stat":
                 filename = Utils.readFilenameFromSyscallParameter(
                     syscall, 'filename')
+
+                # Not sure it's possible to parse the stat structure here.
+                # It has different members depending on a myriad of different things.
+                # Just use the python os stats call at this point?
+                addr: int = syscall['statbuf'].value
+
                 print(f"> cache stat: {filename}")
-                # not quite the same... but close
-                self.inputs.cache_additional_file(filename)
+                self.inputs.cache_stat(filename)
 
             if syscall.name == "fstat":
-                print(f"> cache stat: (ToDo: track file descriptors)")
+                fd: int = syscall['fd'].value
+                print(f"> fstat of {fd}")
+                self.inputs.cache_stat(self.filedescriptor_to_path[fd])
+                print(f"> cache fstat: {self.filedescriptor_to_path[fd]}")
+
+            if syscall.name == "close":
+                fd: int = syscall['fd'].value
+                print(f"> fd closed: {self.filedescriptor_to_path[fd]}")
+                del self.filedescriptor_to_path[fd]
 
 
 class TCache(Application):
@@ -225,6 +282,9 @@ class TCache(Application):
         except PTRACE_ERRORS as err:
             writeError(getLogger(), err, "Debugger error")
         self.debugger.quit()
+
+        print("\n\nEverything to cache:")
+        self.syscall_listener.inputs.print()
 
 
 if __name__ == "__main__":
