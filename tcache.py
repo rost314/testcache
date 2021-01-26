@@ -51,21 +51,24 @@ class Inputs:
 
 
 class Utils:
-    def readCString(process: PtraceProcess, addr) -> str:
+    @staticmethod
+    def read_c_string(process: PtraceProcess, addr) -> str:
         """Read C-String from process memory space at addr and return it."""
-        data, truncated = process.readCString(addr, 5000)
+        data, truncated = process.read_c_string(addr, 5000)
         if truncated:
             return None  # fail in an obvious way for now
         return data
 
     # Surprisingly common use case
-    def readFilenameFromSyscallParameter(syscall: PtraceSyscall, argument_name: str) -> str:
-        cstring: str = Utils.readCString(
+    @staticmethod
+    def read_filename_from_syscall_parameter(syscall: PtraceSyscall, argument_name: str) -> str:
+        cstring: str = Utils.read_c_string(
             syscall.process, syscall[argument_name].value)
         filename: str = os.fsdecode(cstring)
         return filename
 
-    def get_digest(file_path: str) -> str:
+    @staticmethod
+    def get_digest(file_path):
         # Reuse stat call? Usually there was a stat call before this.
         if not os.path.exists(file_path):
             return None
@@ -99,45 +102,47 @@ class SyscallListener:
         self.inputs = Inputs()
         return
 
-    def ignoreSyscall(syscall: PtraceSyscall) -> bool:
+    @staticmethod
+    def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to find those interesting functions
         ignore = ["arch_prctl", "mprotect", "pread64", "pwrite64", "read", "write",
                   "mmap", "munmap", "brk", "sbrk"]
         return syscall.name in ignore
 
-    def displaySyscall(syscall: PtraceSyscall) -> None:
+    @staticmethod
+    def display_syscall(syscall: PtraceSyscall) -> None:
         print(f"{syscall.format():80s} = {syscall.result_text}")
 
-    def onSignal(self, event) -> None:
+    def on_signal(self, event) -> None:
         # ProcessSignal has “signum” and “name” attributes
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads process
         #       memory to analyze the reasons why the signal was sent.
         return
 
-    def onProcessExited(self, event: ProcessExit) -> None:
+    def on_process_exited(self, event: ProcessExit) -> None:
         # process exited with an exitcode, killed by a signal or exited abnormally
         # Note: ProcessExit has “exitcode” and “signum” attributes (both can be None)
         state = event.process.syscall_state
         if (state.next_event == "exit") and state.syscall:
             # Process was killed by a syscall
-            SyscallListener.displaySyscall(state.syscall)
+            SyscallListener.display_syscall(state.syscall)
 
         # Display exit message
         error(f"*** {event} ***")
 
-    def onNewProcessEvent(self, event: NewProcessEvent) -> None:
+    def on_new_process_event(self, event: NewProcessEvent) -> None:
         # new process created, e.g. after a fork() syscall
         # use process.parent attribute to get the parent process.
         process = event.process
         error("*** New process %s ***" % process.pid)
         self.prepareProcess(process)
 
-    def onProcessExecution(self, event) -> None:
+    def on_process_execution(self, event) -> None:
         process = event.process
         error("*** Process %s execution ***" % process.pid)
 
-    def onSyscall(self, process: PtraceProcess):
+    def on_syscall(self, process: PtraceProcess):
         state = process.syscall_state
         syscall: PtraceSyscall = state.event(FunctionCallOptions(
             write_types=True,
@@ -147,15 +152,15 @@ class SyscallListener:
             write_address=True,
             max_array_count=50,
         ))
-        if syscall and syscall.result is not None and not SyscallListener.ignoreSyscall(syscall):
-            SyscallListener.displaySyscall(syscall)
+        if syscall and syscall.result is not None and not SyscallListener.ignore_syscall(syscall):
+            SyscallListener.display_syscall(syscall)
 
             if syscall.name == "openat":
                 flags: int = syscall['flags'].value
                 O_READONLY: int = 0
                 O_CLOEXEC: int = 0o2000000
                 readonly: bool = flags == O_READONLY or flags == O_CLOEXEC
-                filename = Utils.readFilenameFromSyscallParameter(
+                filename = Utils.read_filename_from_syscall_parameter(
                     syscall, 'filename')
                 if readonly:
                     print(f"> cache additional file: {filename}")
@@ -168,14 +173,14 @@ class SyscallListener:
                 print(f"> Tracking fd: {fd} = {filename}")
 
             if syscall.name == "access":
-                filename = Utils.readFilenameFromSyscallParameter(
+                filename = Utils.read_filename_from_syscall_parameter(
                     syscall, 'filename')
                 print(f"> cache file access rights: {filename}")
                 # for now just cache the entire file
                 self.inputs.cache_additional_file(filename)
 
             if syscall.name == "stat":
-                filename = Utils.readFilenameFromSyscallParameter(
+                filename = Utils.read_filename_from_syscall_parameter(
                     syscall, 'filename')
 
                 # Not sure it's possible to parse the stat structure here.
@@ -203,7 +208,13 @@ class TCache(Application):
     def __init__(self):
         Application.__init__(self)
 
-        self.parseOptions()
+        self.debugger = PtraceDebugger()
+        self.debugger.traceFork()
+        self.debugger.traceExec()
+        self.debugger.traceClone()
+        self.debugger.enableSysgood()
+
+        self.parse_options()
 
         self._output = None
 
@@ -215,7 +226,10 @@ class TCache(Application):
 
         self.syscall_listener = SyscallListener()
 
-    def parseOptions(self):
+    def __del__(self):
+        self.debugger.quit()
+
+    def parse_options(self):
         parser = OptionParser(
             usage="%prog [options] -- program [arg1 arg2 ...]")
         self.createCommonOptions(parser)
@@ -224,7 +238,7 @@ class TCache(Application):
 
         self.processOptions()
 
-    def runDebugger(self):
+    def run_debugger(self):
         """Debug process and trigger syscall_listener on every syscall"""
 
         # Create stopped process (via fork followed by PTRACE_TRACEME) with given parameters
@@ -242,37 +256,32 @@ class TCache(Application):
         # Start process, but break at system calls
         process.syscall()
 
+        # Turn exception based interface into one that uses on_* methods.
         # ToDo: what exactly does this condition test?
         while self.debugger:
             try:
                 # We have set breakpoints to occure on syscalls.
                 # Therefore breakpoint are handled by onSyscall.
                 breakpoint = self.debugger.waitSyscall()
-                self.syscall_listener.onSyscall(breakpoint.process)
+                self.syscall_listener.on_syscall(breakpoint.process)
                 # Docs: proceed with syscall??
                 # Reality??: break at next one
                 breakpoint.process.syscall()
             except ProcessExit as interrupt:
-                self.syscall_listener.onProcessExited(interrupt)
+                self.syscall_listener.on_process_exited(interrupt)
             except ProcessSignal as signal:
-                self.syscall_listener.onSignal(signal)
+                self.syscall_listener.on_signal(signal)
                 signal.process.syscall(signal.signum)
             except NewProcessEvent as event:
-                self.syscall_listener.onNewProcessEvent(event)
+                self.syscall_listener.on_new_process_event(event)
                 event.process.parent.syscall()
             except ProcessExecution as exec:
-                self.syscall_listener.onProcessExecution(exec)
+                self.syscall_listener.on_process_execution(exec)
                 exec.process.syscall()
 
     def main(self):
-        self.debugger = PtraceDebugger()
-        self.debugger.traceFork()
-        self.debugger.traceExec()
-        self.debugger.traceClone()
-        self.debugger.enableSysgood()
-
         try:
-            self.runDebugger()
+            self.run_debugger()
         except ProcessExit as event:
             self.processExited(event)
         except PtraceError as err:
@@ -281,7 +290,6 @@ class TCache(Application):
             error("Interrupted.")
         except PTRACE_ERRORS as err:
             writeError(getLogger(), err, "Debugger error")
-        self.debugger.quit()
 
         print("\n\nEverything to cache:")
         self.syscall_listener.inputs.print()
