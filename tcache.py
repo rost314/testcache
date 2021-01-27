@@ -24,6 +24,7 @@ from ptrace.syscall import (FILENAME_ARGUMENTS, SOCKET_SYSCALL_NAMES,
 # ToDo: drop Application. It's too restrictive.
 # ToDo: tcache and testcache are already reserved on GitHub.
 #       bincache/bcache? genericcache?
+# How about slowtestcache?
 
 
 class Inputs:
@@ -102,7 +103,7 @@ class SyscallListener:
     # stdout, stderr... but mixed... puh...
     output: int
 
-    filedescriptor_to_path = ()
+    filedescriptor_to_path = {}
 
     def __init__(self):
         self.inputs = Inputs()
@@ -112,8 +113,8 @@ class SyscallListener:
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to
         # find those interesting functions...
-        ignore = ["arch_prctl", "mprotect", "pread64", "pwrite64", "read",
-                  "write", "mmap", "munmap", "brk", "sbrk"]
+        ignore = {"arch_prctl", "mprotect", "pread64", "pwrite64", "read",
+                  "write", "mmap", "munmap", "brk", "sbrk"}
         return syscall.name in ignore
 
     @staticmethod
